@@ -1,0 +1,20 @@
+# Secrets - never commit
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+*.egg-info/
+
+# Node / frontend build artifacts
+node_modules/
+frontend/dist/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store

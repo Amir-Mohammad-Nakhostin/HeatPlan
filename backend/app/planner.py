@@ -1,0 +1,841 @@
+"""Candidate plan generation + deterministic ranking.
+
+FortyGuard supplies the thermal field; HeatPlan computes exposure and ranks.
+The LLM is never asked to rank or to produce numbers.
+
+Plan archetypes:
+  A - Fastest  (requested start / direct path)  -> baseline
+  B - Balanced (moderate start shift / small cool detour)
+  C - Coolest  (largest feasible shift / detour)
+
+Forecast architecture (authoritative, see app.thermal):
+
+  1. FORECAST HORIZON
+     Rolling Phoenix-local window [now, now + MAX_FUTURE_HOURS). The
+     documented ~+12 h forecast limit is a HORIZON, never a bundle of twelve
+     pre-fetched heatmaps: every hourly grid is fetched with its OWN
+     FortyGuard request (filter_type=1 serves exactly one hour).
+
+  2. REQUIRED TIMESTAMPS
+     Hour-aligned timestamps for the intervals actually traversed by each
+     candidate's start + ACTUAL duration (the activity endpoint is NOT added
+     when it falls on an hour boundary) - never hard-coded to 12 hours, and
+     never merely the user's originally requested duration.
+
+  3. USABLE TIMESTAMPS
+     Only timestamps whose live response has non-empty map_data.features and
+     n_cells > 0. An empty result (features == [] / n_cells == 0) means that
+     timestamp currently has NO usable spatial result (UNAVAILABLE) - NOT
+     "the forecast window ended" (OUTSIDE_HORIZON). The two statuses are
+     distinct and reported separately.
+
+  4. REQUESTED vs SEARCH SPACE (C3)
+     The USER REQUEST (exact requested interval) is resolved and reported on
+     its own. The internal SEARCH SPACE (alternative candidate starts)
+     produces candidate-attributed reports that never pollute the
+     user-facing failure message. If the requested interval itself is
+     unsupported the user sees exactly which of ITS hours are
+     OUTSIDE_HORIZON / UNAVAILABLE; if the requested interval is supported
+     but no alternative could be validated the user is told exactly that,
+     never that their interval is unsupported.
+"""
+from __future__ import annotations
+
+import math
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta
+
+from .exposure import exposure, exposure_timeline
+from .fortyguard_client import (
+    MAX_FUTURE_HOURS,
+    PHOENIX_TZ,
+    forecast_horizon,
+    get_heat_grid,
+    now_phoenix,
+)
+from .models import ParsedIntent, Plan, TimelinePoint
+from .thermal import (
+    TimestampStatus,
+    ThermalIntervalResult,
+    candidate_feasible,
+    required_hourly_timestamps,
+    resolve_thermal_interval,
+)
+
+# Route-duration contract (see backend/docs/route_duration_contract.md).
+# ROUTE DURATION SEMANTICS
+# ------------------------
+# HeatPlan distinguishes four related but DISTINCT quantities:
+#
+#   A. USER REQUESTED DURATION  - intent.duration_minutes; the minutes the
+#      user says they want to spend on the activity.
+#   B. ACTUAL ROUTE DURATION    - _path_m(path) / WALK_SPEED_M_S / 60; the
+#      time required to traverse a specific candidate polyline. Comes from
+#      geometry, not from the intent field.
+#   C. THERMAL COVERAGE         - required_hourly_timestamps(start, B); the
+#      hourly grids required for the candidate to be feasible. Every hour
+#      the walker is actually inside during the walk must be USABLE.
+#   D. EXPOSURE                 - the estimated temperature-based thermal
+#      burden accumulated over B (never A). Each sample uses the grid of
+#      the EXACT hour it falls in (_grid_for_hour raises on a missing hour
+#      instead of substituting another hour's grid).
+#
+# INVARIANTS
+#   * B is used for candidate feasibility and exposure - never A.
+#   * A is used only for reporting the USER-REQUESTED interval failure
+#     (see IntervalUnsupportedError / requested_result), never to score
+#     candidates.
+#   * Partial thermal coverage is never scored - a candidate whose full B
+#     is not covered is INFEASIBLE (excluded and reported).
+#   * No wrong-hour fallback - a missing hourly grid is a hard failure.
+#   * The polyline is never stretched or shortened to match A.
+WALK_SPEED_M_S = 1.4
+SAMPLE_STEP_M = 100.0
+
+_WEIGHTS = {
+    "high": (0.70, 0.20, 0.10),
+    "medium": (0.50, 0.30, 0.20),
+    "low": (0.25, 0.55, 0.20),
+}
+
+_NAMES = {"A": "Fastest", "B": "Balanced", "C": "Coolest"}
+_STRATEGIES = {
+    "A": "Requested start time; fastest option and baseline.",
+    "B": "Balanced trade-off: the feasible candidate closest to the midpoint "
+         "between the earliest and the coolest option.",
+    "C": "Largest feasible shift; lowest estimated thermal exposure.",
+}
+
+
+# --------------------------------------------------------------------------
+# Candidate-attributed diagnostics (C3)
+# --------------------------------------------------------------------------
+@dataclass
+class CandidateReport:
+    """One candidate of the internal search space and its resolution.
+
+    Every ThermalIntervalResult generated by the search stays associated
+    with the candidate (start_time + shift) that produced it, so alternative
+    candidates can never be conflated with the user's requested interval.
+    """
+
+    start_time: str  # HH:MM (Phoenix local) of this candidate start
+    shift: int       # whole hours after the requested start
+    result: ThermalIntervalResult
+
+
+@dataclass
+class SearchSummary:
+    """Compact record of the candidate search, for logs/debug/tests."""
+
+    requested_start: datetime
+    requested_duration_minutes: int
+    candidate_shifts: list[int] = field(default_factory=list)
+    feasible_shifts: list[int] = field(default_factory=list)
+
+
+class IntervalUnsupportedError(Exception):
+    """Structured, candidate-attributed planning failure (C3).
+
+    The user-facing message is derived ONLY from the requested interval's own
+    resolution (`requested_result`). Alternative-candidate diagnostics stay on
+    the exception (`candidate_reports`, `search_summary`) for logs/debug/tests
+    and are never flattened into the user-facing string.
+
+    Semantic distinction (mandatory):
+      - requested interval itself invalid
+            -> the message names exactly the requested interval's
+               OUTSIDE_HORIZON / UNAVAILABLE hours
+      - requested interval valid but no alternative plan could be validated
+            -> a concise "no alternative" message; the requested interval is
+               NEVER claimed to be unsupported in this case
+    """
+
+    code = "THERMAL_INTERVAL_UNSUPPORTED"
+
+    def __init__(
+        self,
+        requested_result: ThermalIntervalResult,
+        candidate_reports: list[CandidateReport] | None = None,
+        search_summary: SearchSummary | None = None,
+        *,
+        alternative_none_found: bool = False,
+    ):
+        self.requested_result = requested_result
+        self.candidate_reports = list(candidate_reports or [])
+        self.search_summary = search_summary
+        self.alternative_none_found = alternative_none_found
+        if alternative_none_found and requested_result is not None and requested_result.valid:
+            self.code = "NO_FEASIBLE_ALTERNATIVE"
+        super().__init__(self._compose_message())
+
+    # -- user-facing message ------------------------------------------------
+    def _compose_message(self) -> str:
+        if self.alternative_none_found:
+            return (
+                "Live thermal data supports the requested interval, but no "
+                "alternative plan could be validated within the current "
+                "forecast window."
+            )
+        req = self.requested_result
+        if req is not None:
+            outside = sorted({c.timestamp for c in req.checks
+                              if c.status is TimestampStatus.OUTSIDE_HORIZON})
+            unav = sorted({c.timestamp for c in req.checks
+                           if c.status is TimestampStatus.UNAVAILABLE})
+            if outside or unav:
+                parts: list[str] = []
+                parts.append(
+                    "Requested thermal interval: "
+                    + ", ".join(t.strftime("%H:%M") for t in req.required)
+                    + ".")
+                if unav:
+                    parts.append(
+                        "Unavailable live thermal data: "
+                        + ", ".join(t.strftime("%H:%M") for t in unav)
+                        + ".")
+                if outside:
+                    parts.append(
+                        "Outside current forecast horizon: "
+                        + ", ".join(t.strftime("%H:%M") for t in outside)
+                        + ".")
+                parts.append("No missing thermal data is fabricated.")
+                return " ".join(parts)
+        return "The requested thermal interval is not fully supported by live data."
+
+    # -- structured shapes for the API layer --------------------------------
+    @property
+    def requested_interval_public(self) -> dict:
+        """The requested interval, with each of ITS hours classified. This is
+        the only per-hour detail the frontend ever receives; alternative
+        candidates stay in `diagnostics`/on the exception."""
+        req = self.requested_result
+        if req is None:
+            return {}
+        return {
+            "required": [t.strftime("%H:%M") for t in req.required],
+            "checks": [
+                {
+                    "timestamp": c.timestamp.strftime("%H:%M"),
+                    "status": c.status.value,
+                    "detail": c.detail,
+                }
+                for c in req.checks
+            ],
+            "horizon_start": (req.horizon_start.isoformat()
+                              if req.horizon_start else None),
+            "horizon_end": (req.horizon_end.isoformat()
+                            if req.horizon_end else None),
+        }
+
+    @property
+    def diagnostics_public(self) -> dict:
+        """Compact search-space summary (no raw candidate internals)."""
+        alternatives = [r for r in self.candidate_reports if r.shift != 0]
+        return {
+            "alternative_candidates": len(alternatives),
+            "search_summary": {
+                "candidate_shifts": (list(self.search_summary.candidate_shifts)
+                                     if self.search_summary else []),
+                "feasible_shifts": (list(self.search_summary.feasible_shifts)
+                                    if self.search_summary else []),
+            },
+        }
+
+
+@dataclass
+class _Candidate:
+    id: str
+    name: str
+    strategy: str
+    start_time: str
+    duration_minutes: float
+    distance_m: float
+    geometry: list[list[float]] = field(default_factory=list)
+    # (elapsed_offset_minutes, temperature_f, block_duration_minutes); the
+    # temperature is a raw tile temperature (°F), NOT an apparent /
+    # physiological metric.
+    samples: list[tuple[int, float, float]] = field(default_factory=list)
+    exposure: float = 0.0  # temperature-based thermal burden (burden·min)
+    avg_temp: float = 0.0
+
+
+def _hhmm(h: int) -> str:
+    return f"{h:02d}:00"
+
+
+def _parse_hhmm(s: str) -> tuple[int, int]:
+    try:
+        h, m = (int(x) for x in s.split(":"))
+        return h, m
+    except (ValueError, AttributeError):
+        return 14, 0
+
+
+def _minutes_between(a: str, b: str) -> float:
+    ha, ma = _parse_hhmm(a)
+    hb, mb = _parse_hhmm(b)
+    return float((hb * 60 + mb) - (ha * 60 + ma))
+
+
+def _haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    r = 6371000.0
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    dp = math.radians(lat2 - lat1)
+    dl = math.radians(lon2 - lon1)
+    a = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
+    return 2 * r * math.asin(math.sqrt(a))
+
+
+def _path_m(path: list[list[float]]) -> float:
+    return sum(_haversine_m(a[0], a[1], b[0], b[1]) for a, b in zip(path, path[1:]))
+
+
+def _start_local(intent: ParsedIntent) -> datetime:
+    """Resolve the intent's start into a Phoenix-aware datetime.
+
+    DATE SEMANTICS (explicit): HeatPlan plans against the ROLLING Phoenix
+    forecast horizon [now, now + 12h). A request may name a `date`, and it
+    is honored literally as the calendar date of the start time, but only
+    starts whose required hourly timestamps fall inside the rolling window
+    are plannable; everything else is rejected as OUTSIDE_HORIZON before
+    any FortyGuard request. Historical planning is NOT implemented: a past
+    date deterministically yields a 422 outside-horizon response, never
+    archived data and never a fabricated grid. A malformed date string
+    falls back to "today" rather than crashing.
+
+    TIMEZONE SEMANTICS (C2 / D3): the intent's start is a Phoenix-LOCAL
+    clock time.
+      * A naive date string (YYYY-MM-DD) is interpreted AS Phoenix local;
+        the timezone is attached to the intended local clock fields, never
+        guessed from the developer machine.
+      * An already-aware datetime is first converted with
+        base.astimezone(PHOENIX_TZ) and ONLY THEN are the intended local
+        clock fields (start_time) applied, so an offset-bearing input can
+        never silently stamp Phoenix time onto UTC wall time.
+      * No manual UTC offset arithmetic anywhere (no hard-coded UTC-7).
+    """
+    if intent.date:
+        try:
+            base = datetime.fromisoformat(intent.date)
+        except ValueError:
+            base = now_phoenix()
+    else:
+        base = now_phoenix()
+    h, m = _parse_hhmm(intent.start_time)
+    if base.tzinfo is None:
+        # Naive date: interpret it explicitly as Phoenix local time.
+        return base.replace(hour=h, minute=m, tzinfo=PHOENIX_TZ)
+    # Aware datetime: the intended local clock fields belong to the Phoenix
+    # wall-clock instant of that instant's local time.
+    phx = base.astimezone(PHOENIX_TZ)
+    return phx.replace(hour=h, minute=m)
+
+
+# --------------------------------------------------------------------------
+# Thermal fetch (per-hour grids, captured for exposure scoring)
+# --------------------------------------------------------------------------
+def _hour_key(dt: datetime) -> datetime:
+    """Top-of-hour cache key for a Phoenix-aware timestamp."""
+    return dt.replace(minute=0, second=0, microsecond=0)
+
+
+# Coordinates are normalized to 6 decimal places (~11 cm at Phoenix
+# latitude) so IEEE-754 representation noise maps to the same cache key,
+# WITHOUT collapsing materially different requested locations onto each
+# other. Rounding to 3 decimals (~110 m) - the previous behavior - could
+# cause the thermal grid fetched for one requested location to be silently
+# reused for a materially different requested location because two
+# distinct requests would produce the same cache key. See the matching
+# note in fortyguard_client._cache_key.
+_REQUEST_CACHE_COORD_DECIMALS = 6
+
+
+def _request_cache_key(lat: float, lon: float, ts: datetime) -> str:
+    """Request-scoped cache key: EXACT (location, date, hour).
+
+    Coordinates are normalized to `_REQUEST_CACHE_COORD_DECIMALS` decimal
+    places so tiny float representation differences do not miss a legitimate
+    exact-location cache hit, while distinct requested locations retain
+    distinct cache identities (no aliasing).
+    """
+    dec = _REQUEST_CACHE_COORD_DECIMALS
+    return (
+        f"heattile:"
+        f"{round(float(lat), dec):.{dec}f}:"
+        f"{round(float(lon), dec):.{dec}f}:"
+        f"{ts:%Y-%m-%d}:{ts.hour}"
+    )
+
+
+def _make_fetch(grids: dict, request_cache: dict | None = None):
+    """fetch(lat, lon, ts) for app.thermal: ONE FortyGuard request per hour,
+    caching the normalized grid by its EXACT timestamp (date + hour).
+
+    L3 - the optional `request_cache` is scoped to ONE /api/plan request and
+    shared across ALL candidates of that request: the exact same
+    (location, date, hour) is resolved once even when several candidate
+    intervals traverse it. A grid is only ever stored under the hour it was
+    requested for; there is no cross-hour reuse."""
+    async def fetch(lat: float, lon: float, ts: datetime):
+        key = _request_cache_key(lat, lon, ts)
+        if request_cache is not None and key in request_cache:
+            grid = request_cache[key]
+        else:
+            grid = await get_heat_grid(lat, lon, ts.strftime("%Y-%m-%d"), ts.hour)
+            if request_cache is not None:
+                request_cache[key] = grid
+        grids[_hour_key(ts)] = grid
+        return grid
+    return fetch
+
+
+def _grid_for_hour(grids: dict, ts: datetime):
+    """Exact-hour lookup ONLY. A thermal sample at hour H must use the grid
+    for hour H; a missing hour is an error (the candidate is infeasible),
+    never a reason to substitute the start/previous/next hour's grid."""
+    key = _hour_key(ts)
+    if key not in grids:
+        raise KeyError(f"no usable grid for hour {key:%Y-%m-%d %H:%M}")
+    return grids[key]
+
+
+# --------------------------------------------------------------------------
+# Search space (C4)
+# --------------------------------------------------------------------------
+def _candidate_shifts(base: datetime, duration_minutes: int,
+                      now: datetime | None = None) -> list[int]:
+    """Whole-hour alternative shifts worth evaluating, DERIVED from the live
+    rolling horizon and the candidate duration - never a hard-coded 12.
+
+    A candidate start S is only worth evaluating when its LAST required
+    hourly timestamp can still fall inside the rolling window. Required
+    hours are the whole hours H with floor(S) <= H < S + duration
+    (half-open interval, see app.thermal.required_hourly_timestamps), so the
+    last required hour <= horizon_end is equivalent to
+
+        S + duration <= horizon_end + 1h        (boundary-inclusive, like
+                                                 timestamp_within_horizon)
+
+    i.e. S <= horizon_end + 1h - duration. MAX_FUTURE_HOURS stays only as a
+    safety ceiling for the shift range, never as the candidate count.
+    Candidates starting before the rolling window opened are useless too and
+    are skipped. The REQUESTED candidate (shift 0, even when earlier than
+    now) is always evaluated separately by callers because its failure is the
+    user-facing answer.
+    """
+    horizon_start, horizon_end = forecast_horizon(now)
+    last_start = (horizon_end + timedelta(hours=1)
+                  - timedelta(minutes=max(1, int(duration_minutes))))
+    shifts: list[int] = []
+    shift = 0
+    # Safety ceiling only (MAX_FUTURE_HOURS + 1 iterations at most): the live
+    # rolling horizon is what actually bounds the search, never a hard-coded
+    # candidate count of 12.
+    while shift <= MAX_FUTURE_HOURS + 1:
+        start = base + timedelta(hours=shift)
+        if start > last_start:
+            break
+        if start >= horizon_start:
+            shifts.append(shift)
+        shift += 1
+    return shifts
+
+
+# --------------------------------------------------------------------------
+# Stationary candidates
+# --------------------------------------------------------------------------
+def _score_hourly(start: datetime, duration_minutes: int, grids: dict,
+                  lat: float, lon: float) -> tuple[float, list, float]:
+    """Sample temperature per traversed hour from the EXACT matching grid.
+
+    The hours are the ones actually traversed by [start, start+duration); a
+    missing hour raises KeyError (no cross-hour substitution)."""
+    end = start + timedelta(minutes=duration_minutes)
+    samples: list[tuple[int, float, float]] = []
+    for hdt in required_hourly_timestamps(start, duration_minutes):
+        block_start = max(hdt, start)
+        block = (min(hdt + timedelta(hours=1), end) - block_start).total_seconds() / 60.0
+        if block <= 0:
+            continue
+        grid = _grid_for_hour(grids, block_start)
+        offset = (block_start - start).total_seconds() / 60.0
+        samples.append((int(offset), grid.nearest_temp(lat, lon), block))
+    temps = [t for _, t, _ in samples]
+    # exposure() takes (temperature_f, duration_minutes) pairs; the planner's
+    # samples also carry the elapsed offset as the first element.
+    return exposure([(t, d) for _, t, d in samples]), samples, sum(temps) / len(temps)
+
+
+async def _stationary_candidates(intent: ParsedIntent, *, now=None):
+    """Resolve the REQUESTED interval plus the bounded alternative search.
+
+    A. USER REQUEST   - the exact requested interval is resolved FIRST and on
+                        its own; its failure is the user-facing answer.
+    B. SEARCH SPACE   - alternative whole-hour starts derived from the live
+                        rolling horizon and the candidate duration (C4).
+    C. DIAGNOSTICS    - every candidate keeps its own CandidateReport.
+    D. USER FAILURE   - built later from `requested_result` alone.
+
+    Only candidates whose ENTIRE required thermal interval is supported by
+    usable live data are kept. Missing data is never fabricated and no other
+    hour's grid is ever substituted.
+    """
+    duration = int(intent.duration_minutes)
+    base = _start_local(intent)
+    request_cache: dict = {}
+
+    # A. The requested interval, always resolved on its own.
+    grids_req: dict = {}
+    requested_result = await resolve_thermal_interval(
+        intent.lat, intent.lon, base, duration,
+        _make_fetch(grids_req, request_cache), now=now)
+    if not candidate_feasible(requested_result):
+        # C3: the user-facing answer is the requested interval's own failure.
+        # Exploring alternatives would add nothing but wasted FortyGuard
+        # requests when the requested interval itself is unsupported.
+        return [], requested_result, [], SearchSummary(
+            requested_start=base,
+            requested_duration_minutes=duration,
+            candidate_shifts=[],
+            feasible_shifts=[],
+        )
+
+    # B. Bounded alternative search (C4).
+    shifts = _candidate_shifts(base, duration, now=now)
+
+    candidates: list[tuple[int, _Candidate]] = []
+    reports: list[CandidateReport] = []
+    feasible_shifts: list[int] = []
+
+    for shift in shifts:
+        start = base + timedelta(hours=shift)
+        grids: dict = {}
+        result = await resolve_thermal_interval(
+            intent.lat, intent.lon, start, duration,
+            _make_fetch(grids, request_cache), now=now)
+        reports.append(CandidateReport(
+            start_time=start.strftime("%H:%M"), shift=shift, result=result))
+        if not candidate_feasible(result):
+            continue  # DO NOT fabricate: interval not fully usable
+        feasible_shifts.append(shift)
+        expo, samples, avg = _score_hourly(start, duration, grids,
+                                           intent.lat, intent.lon)
+        candidates.append((shift, _Candidate(
+            id="", name="", strategy="", start_time=start.strftime("%H:%M"),
+            duration_minutes=float(duration), distance_m=0.0, geometry=[],
+            samples=samples, exposure=expo, avg_temp=avg)))
+
+    summary = SearchSummary(
+        requested_start=base,
+        requested_duration_minutes=duration,
+        candidate_shifts=shifts,
+        feasible_shifts=feasible_shifts,
+    )
+    return candidates, requested_result, reports, summary
+
+
+def _select_archetypes(candidates: list[tuple[int, _Candidate]]) -> list[_Candidate]:
+    """Choose A (earliest/requested), B (balanced trade-off), C (coolest).
+
+    The three plans are meant to expose a real trade-off, not three points
+    on the same axis:
+      A - time-oriented:     the earliest feasible start.
+      C - exposure-oriented: the feasible candidate with the lowest
+                             deterministic exposure (earliest start breaks
+                             ties).
+      B - balanced:          among the remaining feasible candidates, the
+                             one closest to the midpoint between A and C in
+                             (start shift, exposure) space, with both axes
+                             min-max normalized so neither dominates. If no
+                             third distinct candidate exists, B falls back
+                             to C (degenerate two-option horizon).
+
+    Selection is a pure deterministic function of the feasible candidates;
+    ranking weights are untouched (they decide the recommendation, not the
+    candidate set).
+    """
+    if not candidates:
+        return []
+    by_shift = dict(candidates)
+    earliest = min(by_shift)
+    a_cand = by_shift[earliest]
+    c_cand = min(candidates, key=lambda sc: (sc[1].exposure, sc[0]))[1]
+
+    others = [sc for sc in candidates if sc[1] not in (a_cand, c_cand)]
+    if others:
+        c_shift = next(s for s, c in candidates if c is c_cand)
+        shifts = [s for s, _ in candidates]
+        expos = [c.exposure for _, c in candidates]
+        s_lo, s_hi = min(shifts), max(shifts)
+        e_lo, e_hi = min(expos), max(expos)
+
+        def _norm_s(shift: int) -> float:
+            return 0.0 if s_hi <= s_lo else (shift - s_lo) / (s_hi - s_lo)
+
+        def _norm_e(expo: float) -> float:
+            return 0.0 if e_hi <= e_lo else (expo - e_lo) / (e_hi - e_lo)
+
+        # Midpoint between A (earliest start) and C (lowest exposure) in
+        # normalized (start shift, exposure) space; both axes scaled to
+        # [0, 1] so neither dominates. Earliest start breaks ties.
+        mid_s = (_norm_s(earliest) + _norm_s(c_shift)) / 2.0
+        mid_e = (_norm_e(a_cand.exposure) + _norm_e(c_cand.exposure)) / 2.0
+
+        def _mid_dist(sc: tuple[int, _Candidate]) -> tuple[float, int]:
+            shift, cand = sc
+            return (abs(_norm_s(shift) - mid_s)
+                    + abs(_norm_e(cand.exposure) - mid_e), shift)
+
+        b_cand = min(others, key=_mid_dist)[1]
+    else:
+        b_cand = c_cand
+
+    chosen: list[_Candidate] = []
+    for cand in (a_cand, b_cand, c_cand):
+        if cand not in chosen:
+            chosen.append(cand)
+    for _, cand in sorted(candidates, key=lambda sc: (sc[1].exposure, sc[0])):
+        if len(chosen) >= 3:
+            break
+        if cand not in chosen:
+            chosen.append(cand)
+    return chosen[:3]
+
+
+# --------------------------------------------------------------------------
+# Route candidates
+# --------------------------------------------------------------------------
+def _sample_path(path: list[list[float]], start: datetime,
+                 duration_minutes: float,
+                 grids: dict) -> list[tuple[int, float, float]]:
+    """Sample the EXACT candidate geometry, traversing EVERY segment in order.
+
+    Cumulative distance is built across all vertices, so a waypoint route
+    A -> C -> B is sampled along A -> C -> B (never along the straight A -> B
+    chord). Each sample's thermal grid is the grid of the EXACT hour the
+    walker is in at that point; a missing hour raises KeyError (the candidate
+    is infeasible) instead of substituting another hour's grid.
+    """
+    total = _path_m(path)
+    if total <= 0:
+        grid = _grid_for_hour(grids, start)
+        return [(0, grid.nearest_temp(path[0][0], path[0][1]), duration_minutes)]
+
+    # Cumulative distance at every vertex -> full-polyline traversal.
+    cum = [0.0]
+    for a, b in zip(path, path[1:]):
+        cum.append(cum[-1] + _haversine_m(a[0], a[1], b[0], b[1]))
+
+    end_dt = start + timedelta(minutes=duration_minutes)
+    n = max(1, int(round(total / SAMPLE_STEP_M)))
+    step_min = duration_minutes / n
+    samples: list[tuple[int, float, float]] = []
+    for i in range(1, n + 1):
+        d = total * i / n
+        # Locate the segment containing distance d, then interpolate INSIDE it.
+        seg = 0
+        for j in range(len(cum) - 1):
+            if cum[j + 1] >= d or j == len(cum) - 2:
+                seg = j
+                break
+        seg_len = cum[seg + 1] - cum[seg]
+        f = 0.0 if seg_len <= 0 else (d - cum[seg]) / seg_len
+        a, b = path[seg], path[seg + 1]
+        la = a[0] + (b[0] - a[0]) * f
+        lo = a[1] + (b[1] - a[1]) * f
+        elapsed_min = d / WALK_SPEED_M_S / 60.0
+        ts = start + timedelta(minutes=elapsed_min)
+        if ts >= end_dt:  # final sample lands exactly on the endpoint hour
+            ts = end_dt - timedelta(seconds=1)
+        grid = _grid_for_hour(grids, ts)  # exact hour only - no fallback
+        samples.append((int(elapsed_min), grid.nearest_temp(la, lo), step_min))
+    return samples
+
+
+def _coolest_point_near(lat: float, lon: float, *, radius_deg: float,
+                        grids: dict) -> list[float]:
+    """Coolest heat-grid point within `radius_deg` of (lat, lon)."""
+    best = None
+    for grid in grids.values():
+        for la, lo, t in grid.points():
+            if abs(la - lat) <= radius_deg and abs(lo - lon) <= radius_deg:
+                if best is None or t < best[2]:
+                    best = (la, lo, t)
+    return [best[0], best[1]] if best else [lat, lon]
+
+
+async def _route_candidates(intent: ParsedIntent, *, now=None):
+    """Route candidates validated against their ACTUAL duration.
+
+    The thermal timeline required for a candidate is derived from the
+    candidate's real walk duration (distance / walk speed), never merely the
+    user's originally requested duration. A candidate whose full duration is
+    not covered by usable thermal data is INFEASIBLE (excluded and reported);
+    exposure is never computed from data that does not cover the complete
+    route, and no other hour's grid is ever substituted.
+
+    The requested-interval resolution (selection) is returned as
+    `requested_result` so callers can report its failure exactly like the
+    stationary path (C3).
+    """
+    start = _start_local(intent)
+    requested = int(intent.duration_minutes)
+    request_cache: dict = {}
+
+    # Thermal context for waypoint selection uses the requested interval.
+    grids_sel: dict = {}
+    requested_result = await resolve_thermal_interval(
+        intent.lat, intent.lon, start, requested,
+        _make_fetch(grids_sel, request_cache), now=now)
+
+    # Waypoint selection and candidate validation share one request-scoped
+    # cache and the grids fetched during selection are reused (L3).
+    grids = grids_sel
+    fetch = _make_fetch(grids, request_cache)
+
+    end = [intent.end_lat or intent.lat, intent.end_lon or intent.lon]
+    cool1 = _coolest_point_near(intent.lat, intent.lon, radius_deg=0.02, grids=grids)
+    cool2 = _coolest_point_near(intent.lat, intent.lon, radius_deg=0.06, grids=grids)
+
+    specs = [
+        ([[intent.lat, intent.lon], end],
+         "Fastest", "Direct route: minimum time and distance (baseline)."),
+        ([[intent.lat, intent.lon], cool1, end],
+         "Balanced", "Small detour through a noticeably cooler corridor."),
+        ([[intent.lat, intent.lon], cool2, end],
+         "Coolest", "Largest detour through the coolest nearby area."),
+    ]
+
+    candidates: list[_Candidate] = []
+    reports: list[CandidateReport] = []
+    for path, name, strategy in specs:
+        dist = _path_m(path)  # total distance from EVERY segment, in order
+        dur = max(dist / WALK_SPEED_M_S / 60.0, 1.0)  # duration of the FULL route
+        # Synchronize thermal validation with the ACTUAL candidate duration.
+        res = await resolve_thermal_interval(
+            intent.lat, intent.lon, start, int(math.ceil(dur)), fetch, now=now)
+        reports.append(CandidateReport(
+            start_time=start.strftime("%H:%M"), shift=0, result=res))
+        if not candidate_feasible(res):
+            continue  # infeasible: never scored on partial coverage
+        samples = _sample_path(path, start, dur, grids)
+        expo = exposure([(t, d) for _, t, d in samples])
+        temps = [t for _, t, _ in samples]
+        candidates.append(_Candidate(
+            id="", name=name, strategy=strategy, start_time=_hhmm(start.hour),
+            duration_minutes=dur, distance_m=dist, geometry=path,
+            samples=samples, exposure=expo, avg_temp=sum(temps) / len(temps)))
+
+    summary = SearchSummary(
+        requested_start=start,
+        requested_duration_minutes=requested,
+        candidate_shifts=[0] * len(specs),
+        feasible_shifts=[0] * len(candidates),
+    )
+    if not candidates:
+        raise IntervalUnsupportedError(
+            requested_result=requested_result,
+            candidate_reports=reports,
+            search_summary=summary,
+            alternative_none_found=candidate_feasible(requested_result),
+        )
+    return candidates, requested_result, reports, summary
+
+
+# --------------------------------------------------------------------------
+# Ranking (deterministic, reproducible)
+# --------------------------------------------------------------------------
+def norm(vals: list[float]) -> list[float]:
+    lo, hi = min(vals), max(vals)
+    if hi <= lo:
+        return [0.0] * len(vals)
+    return [(v - lo) / (hi - lo) for v in vals]
+
+
+def rank(candidates: list[_Candidate], heat_priority: str) -> dict[str, float]:
+    """Weighted score (lower is better). Same input + same data -> same order."""
+    w = _WEIGHTS.get(heat_priority, _WEIGHTS["medium"])
+    ne = norm([c.exposure for c in candidates])
+    nt = norm([c.duration_minutes for c in candidates])
+    nd = norm([c.distance_m for c in candidates])
+    return {
+        c.id: round(w[0] * ne[i] + w[1] * nt[i] + w[2] * nd[i], 6)
+        for i, c in enumerate(candidates)
+    }
+
+
+# --------------------------------------------------------------------------
+# Build plans
+# --------------------------------------------------------------------------
+def build_plans(cands: list[_Candidate]) -> list[Plan]:
+    base = next(c for c in cands if c.id == "A")
+    plans: list[Plan] = []
+    for c in cands:
+        if c.id == "A":
+            red, pen = 0.0, 0.0
+            trade = "Fastest option, but the highest estimated thermal exposure."
+        else:
+            red = 0.0 if base.exposure <= 0 else max(
+                0.0, (1.0 - c.exposure / base.exposure) * 100.0)
+            pen = _minutes_between(base.start_time, c.start_time)
+            if c.id == "B":
+                trade = f"Adds {pen:.0f} min for a {red:.0f}% lower estimated exposure."
+            else:
+                trade = (f"Lowest estimated exposure (-{red:.0f}%), at the "
+                         f"largest time cost (+{pen:.0f} min).")
+        plans.append(Plan(
+            id=c.id, name=c.name, strategy=c.strategy, start_time=c.start_time,
+            duration_minutes=round(c.duration_minutes, 1),
+            distance_m=round(c.distance_m, 1),
+            exposure=round(c.exposure, 2),
+            exposure_reduction_pct=round(red, 1),
+            time_penalty_minutes=round(max(0.0, pen), 1),
+            avg_temperature_f=round(c.avg_temp, 1),
+            geometry=c.geometry,
+            timeline=[TimelinePoint(offset_minutes=int(t["offset_minutes"]),
+                                    temperature_f=t["temperature_f"],
+                                    heat_burden=t["heat_burden"])
+                      for t in exposure_timeline(c.samples)],
+            tradeoff=trade))
+    return plans
+
+
+async def generate_plans(intent: ParsedIntent):
+    if intent.task_type == "route":
+        raw, requested_result, reports, summary = await _route_candidates(intent)
+        cands3 = list(raw)
+    else:
+        raw, requested_result, reports, summary = await _stationary_candidates(intent)
+        cands3 = _select_archetypes(raw)
+
+    # A. If the REQUESTED interval itself is unsupported, the user sees
+    #    exactly that interval's OUTSIDE_HORIZON / UNAVAILABLE hours - never
+    #    timestamps belonging to internal alternative candidates (C3).
+    if not candidate_feasible(requested_result):
+        raise IntervalUnsupportedError(
+            requested_result=requested_result,
+            candidate_reports=reports,
+            search_summary=summary,
+        )
+
+    # B. Requested interval is supported. If the internal search could not
+    #    validate a usable alternative, the user is told exactly that - the
+    #    requested interval is NEVER claimed to be unsupported.
+    if not cands3 or len(cands3) < 2:
+        raise IntervalUnsupportedError(
+            requested_result=requested_result,
+            candidate_reports=reports,
+            search_summary=summary,
+            alternative_none_found=True,
+        )
+
+    for cand, letter in zip(cands3, ("A", "B", "C")):
+        cand.id = letter
+        cand.name = _NAMES[letter]
+        cand.strategy = _STRATEGIES[letter]
+
+    plans = build_plans(cands3)
+    scores = rank(cands3, intent.heat_priority)
+    recommended = min(scores, key=scores.get)
+    return plans, scores, recommended
