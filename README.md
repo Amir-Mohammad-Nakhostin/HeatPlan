@@ -1,5 +1,22 @@
 # HeatPlan
 
+**Find a better time to be outdoors using temperature-based exposure estimates.**
+
+HeatPlan ranks candidate outdoor activity time slots using FortyGuard temperature data. A structured input workflow and deterministic backend make the ranking traceable without relying on an LLM to decide the result.
+
+## Project at a glance
+
+| Aspect | Description |
+| --- | --- |
+| Input | Date, activity duration, available time window and location |
+| Output | Best available slot, alternatives and computed explanations |
+| Engineering | Deterministic validation, forecast-window gating, caching and API integration |
+| Local development | Python backend and web frontend; labeled mock mode without an API key |
+
+The project demonstrates careful API integration, time-zone handling, error contracts and reproducible testing. It is a decision-support prototype, **not a medically validated thermal comfort or safety model**.
+
+## Technical documentation
+
 HeatPlan finds a better time to be outside. You give it four structured
 answers — **when**, **how long**, **what time window**, and **where** — and it
 returns the best time slot plus the other available times in your window,
